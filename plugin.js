@@ -1,107 +1,413 @@
 /**
- * profile-gestures (t_lever spike) — proves a runtime desktop plugin can
- * switch the active Hermes profile via two indirect levers reached through
- * `host`, since the plugin SDK exports no `switchProfile` (see README.md /
- * the kanban card for the bundle-reading evidence).
+ * profile-gestures — Arc-style two-finger horizontal swipe over the sidebar
+ * nav area switches the active Hermes profile.
  *
- * Throwaway quality on purpose: two buttons, no gestures, no overlay.
+ * Runtime desktop plugin: plain ESM, loaded uncompiled, no build step,
+ * hot-reloads on save. Only `@hermes/plugin-sdk` and `react` may be imported
+ * (enforced by the host loader) — everything else here is inlined.
  *
- * UI is jsx() calls — JSX syntax will not parse on this no-build path.
- * Only utilities core already ships are used (no new Tailwind classes).
+ * UI is jsx()/jsxs() calls — JSX syntax will not parse on this no-build path.
+ * Only Tailwind utilities core already ships are used (Tailwind never scans
+ * this file, so a class name that appears only here compiles to nothing).
+ * Codicons are sized with the `size` prop, never `text-[…]`.
+ *
+ * ---------------------------------------------------------------------------
+ * Wheel-gesture phase detection (isStart/isEnding/isMomentum/
+ * isMomentumCancel + axis movement projection) is a stdlib-only reimplementation
+ * of the algorithm in **wheel-gestures** (MIT License, Felix Richter / xiel,
+ * https://wheel-gestures.xiel.dev/docs/on-wheel,
+ * https://github.com/xiel/wheel-gestures). Inlined because runtime plugins
+ * cannot import third-party packages — see `unsupported import` in the host's
+ * plugin loader. Original MIT license text:
+ *
+ *   MIT License
+ *   Copyright (c) Felix Richter
+ *   Permission is hereby granted, free of charge, to any person obtaining a
+ *   copy of this software and associated documentation files (the
+ *   "Software"), to deal in the Software without restriction, including
+ *   without limitation the rights to use, copy, modify, merge, publish,
+ *   distribute, sublicense, and/or sell copies of the Software, and to
+ *   permit persons to whom the Software is furnished to do so, subject to
+ *   the following conditions: the above copyright notice and this permission
+ *   notice shall be included in all copies or substantial portions of the
+ *   Software. THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND.
+ * ---------------------------------------------------------------------------
  */
 
-import { host, SIDEBAR_NAV_AREA, ROUTES_AREA, useQuery } from '@hermes/plugin-sdk'
+import {
+  host,
+  haptic,
+  PROFILE_SWATCHES,
+  SIDEBAR_NAV_AREA,
+  Skeleton
+} from '@hermes/plugin-sdk'
 import { jsx, jsxs } from 'react/jsx-runtime'
+import { useEffect, useRef, useState } from 'react'
 
 const ID = 'profile-gestures'
+const PROFILE_ORDER_KEY = 'hermes.desktop.profileOrder'
 
-/** Non-default profiles sorted by profile order, `default` prepended if present.
- *  Mirrors core's Nt() in profile-D2NTN1hO.js. */
-function orderedProfiles(profiles) {
-  const nonDefault = profiles.filter(p => !p.is_default).map(p => p.name)
-  return profiles.some(p => p.is_default) ? ['default', ...nonDefault] : nonDefault
+/* ---------------------------------------------------------------------------
+ * Profile order — mirrors core's Nt()/It() in profile-D2NTN1hO.js exactly:
+ *   sort non-default profiles by the saved hermes.desktop.profileOrder array
+ *   (names absent from the array sort last, stable), then prepend `default`
+ *   when a default profile exists. Wrap-around neighbour pick uses modulo.
+ * ------------------------------------------------------------------------- */
+
+/** Read the saved order array from localStorage. Renderer-side, so direct. */
+function readSavedProfileOrder() {
+  try {
+    const raw = window.localStorage.getItem(PROFILE_ORDER_KEY)
+    if (!raw) return []
+    const parsed = JSON.parse(raw)
+    return Array.isArray(parsed) ? parsed.filter(n => typeof n === 'string') : []
+  } catch {
+    return []
+  }
 }
 
-/** Wrap-around neighbour pick. Mirrors core's It() in profile-D2NTN1hO.js. */
-function neighbourProfile(profiles, activeName, direction) {
-  const order = orderedProfiles(profiles)
+/** Stable sort of `items` by position in `order`; absent items sort last. */
+function sortByOrder(items, order) {
+  const rank = new Map(order.map((name, i) => [name, i]))
+  return [...items]
+    .map((item, i) => ({ item, i, r: rank.has(item) ? rank.get(item) : Infinity }))
+    .sort((a, b) => (a.r !== b.r ? a.r - b.r : a.i - b.i))
+    .map(({ item }) => item)
+}
+
+/** Core's Nt(): non-default profiles sorted by saved order, `default` prepended. */
+function orderedProfileNames(profiles, savedOrder) {
+  const nonDefault = profiles.filter(p => !p.is_default).map(p => p.name)
+  const sorted = sortByOrder(nonDefault, savedOrder)
+  return profiles.some(p => p.is_default) ? ['default', ...sorted] : sorted
+}
+
+/** Core's It(): wrap-around neighbour pick by +1/-1 direction. */
+function neighbourProfile(order, activeName, direction) {
   if (order.length < 2) return null
   const idx = order.indexOf(activeName)
   const base = idx < 0 ? (direction === 1 ? -1 : 0) : idx
   return order[(base + direction + order.length) % order.length]
 }
 
-function ProfileLeverPane() {
-  const profilesQuery = useQuery({
-    queryKey: [ID, 'profiles'],
-    queryFn: () => host.profiles.list()
-  })
+/* ---------------------------------------------------------------------------
+ * Wheel gesture phase detection — reconstructs the fields Chromium's wheel
+ * event stream doesn't give you directly: isStart, isEnding, isMomentum,
+ * isMomentumCancel, and an axisMovementProjection (predicted resting delta).
+ * See attribution header above.
+ * ------------------------------------------------------------------------- */
 
-  // host.profiles.list()'s exact return shape isn't documented by the SDK;
-  // defensively unwrap {profiles:[...]} or a bare array.
-  const raw = profilesQuery.data
-  const profiles = Array.isArray(raw) ? raw : Array.isArray(raw?.profiles) ? raw.profiles : []
-  const active = host.state.profile.get()
-  const nextName = neighbourProfile(profiles, active, 1)
-  const prevName = neighbourProfile(profiles, active, -1)
+// A new gesture starts if more than this many ms have passed since the last
+// wheel event on this target (mirrors wheel-gestures' default gesture gap).
+const GESTURE_END_GAP_MS = 72
+// A gesture is considered "ending" (about to stop) once this many ms pass
+// with no further wheel events — detected via a timer, since Chromium never
+// fires an explicit end event.
+const GESTURE_IDLE_END_MS = 88
+// Delta magnitude below which trackpad momentum is considered to have
+// decayed to a halt (used to recognise momentum tails).
+const MOMENTUM_DELTA_FLOOR = 0.5
+// How strongly recent deltas are weighted when projecting the resting
+// position (higher = more weight on the most recent samples).
+const PROJECTION_DECAY = 0.86
 
-  // Lever 1: host.newChat(profileName) — starts a new chat in the target
-  // profile and sets window.location.hash = '#/'.
-  const onNext = () => {
-    if (!nextName) return
-    host.newChat(nextName)
+/**
+ * Tracks one continuous wheel-event stream and derives gesture phase +
+ * a projected resting movement, functionally equivalent to wheel-gestures'
+ * WheelEventState / axisMovementProjection.
+ */
+function createWheelGestureTracker({ axis = 'x' } = {}) {
+  let lastTimestamp = 0
+  let isGestureActive = false
+  let wasMomentum = false
+  let accumulatedMovement = 0
+  let projectedRemainder = 0
+  let endTimer = null
+
+  function axisDelta(event) {
+    return axis === 'x' ? event.deltaX : event.deltaY
   }
 
-  // Lever 2: host.openSession(sessionId, { profile, keepAllProfilesScope: false })
-  // — switches AND restores the target profile's most recent persisted
-  // session. Falls back to newChat if there is no persisted session.
-  const onPrev = async () => {
-    if (!prevName) return
-    const sessions = await host.listPersistedSessions(null, { profile: prevName, limit: 1 })
-    const sessionId = sessions?.sessions?.[0]?.id ?? sessions?.[0]?.id
-    if (sessionId) {
-      host.openSession(sessionId, { profile: prevName, keepAllProfilesScope: false })
-    } else {
-      host.notify({ kind: 'error', message: `No persisted session for ${prevName}; falling back to newChat` })
-      host.newChat(prevName)
+  /** Call for every qualifying wheel event. Returns a WheelGestureState. */
+  function update(event) {
+    const now = event.timeStamp ?? Date.now()
+    const delta = axisDelta(event)
+    const gapMs = now - lastTimestamp
+    const isStart = !isGestureActive || gapMs > GESTURE_END_GAP_MS
+    // A real touch landing back on the trackpad interrupts an in-flight
+    // momentum tail: the stream continues (gap still small, so NOT isStart)
+    // but the OS stops reporting momentum deltas. Flag that transition so
+    // callers don't mistake the interruption for the tail just decaying out.
+    const isMomentumCancel = !isStart && wasMomentum && !event.momentum
+    const isMomentum = !!event.momentum || (!isStart && wasMomentum && !isMomentumCancel)
+
+    if (isStart) {
+      accumulatedMovement = 0
+      projectedRemainder = 0
+    }
+
+    accumulatedMovement += delta
+    // Exponential decay projection: assume the remaining momentum tail decays
+    // geometrically from the current delta, same shape as wheel-gestures'
+    // axisMovementProjection.
+    projectedRemainder = delta !== 0
+      ? delta / (1 - PROJECTION_DECAY)
+      : projectedRemainder * PROJECTION_DECAY
+
+    isGestureActive = true
+    wasMomentum = Math.abs(delta) > MOMENTUM_DELTA_FLOOR ? isMomentum : wasMomentum
+    lastTimestamp = now
+
+    return {
+      delta,
+      deltaAccumulated: accumulatedMovement,
+      axisMovementProjection: accumulatedMovement + projectedRemainder,
+      isStart,
+      isMomentum,
+      isMomentumCancel,
+      isEnding: false
     }
   }
 
+  /** Schedule an "ending" callback once the stream has gone idle. */
+  function scheduleEnd(onEnd) {
+    if (endTimer) clearTimeout(endTimer)
+    endTimer = setTimeout(() => {
+      endTimer = null
+      isGestureActive = false
+      const wasMomentumAtEnd = wasMomentum
+      wasMomentum = false
+      onEnd({
+        deltaAccumulated: accumulatedMovement,
+        axisMovementProjection: accumulatedMovement + projectedRemainder,
+        isMomentum: wasMomentumAtEnd,
+        isEnding: true
+      })
+    }, GESTURE_IDLE_END_MS)
+  }
+
+  function cancelEnd() {
+    if (endTimer) {
+      clearTimeout(endTimer)
+      endTimer = null
+    }
+  }
+
+  function reset() {
+    cancelEnd()
+    isGestureActive = false
+    wasMomentum = false
+    accumulatedMovement = 0
+    projectedRemainder = 0
+    lastTimestamp = 0
+  }
+
+  return { update, scheduleEnd, cancelEnd, reset }
+}
+
+// Minimum accumulated travel (px) below which a release snaps back instead
+// of committing a profile switch.
+const MIN_COMMIT_TRAVEL_PX = 48
+
+/** Projection-based destination, clamped to ±1 profile. */
+function resolveDirection(projection) {
+  if (Math.abs(projection) < MIN_COMMIT_TRAVEL_PX) return 0
+  // Natural scrolling: swiping left (negative deltaX) advances to the next
+  // profile, mirroring Arc/Safari's "swipe left to go forward" convention.
+  return projection < 0 ? 1 : -1
+}
+
+/* ---------------------------------------------------------------------------
+ * Overlay component
+ * ------------------------------------------------------------------------- */
+
+function swatchFor(name) {
+  return PROFILE_SWATCHES?.[name] ?? null
+}
+
+function ProfileChip({ name, dimmed }) {
+  const color = swatchFor(name)
   return jsxs('div', {
-    className: 'flex flex-col gap-2 p-2',
+    className:
+      'flex items-center gap-2 rounded-md px-3 py-2 ' +
+      (dimmed ? 'opacity-50' : 'opacity-100'),
     children: [
-      jsx('div', { className: 'text-[0.6875rem] text-(--ui-text-tertiary)', children: `active: ${active}` }),
-      jsx('button', {
-        type: 'button',
-        className: 'rounded px-2 py-1 text-[0.75rem] hover:bg-(--ui-row-hover-background)',
-        onClick: onNext,
-        children: `next profile (newChat) → ${nextName ?? '—'}`
-      }),
-      jsx('button', {
-        type: 'button',
-        className: 'rounded px-2 py-1 text-[0.75rem] hover:bg-(--ui-row-hover-background)',
-        onClick: onPrev,
-        children: `prev profile (openSession) → ${prevName ?? '—'}`
+      color
+        ? jsx('span', {
+            className: 'size-2.5 shrink-0 rounded-full',
+            style: { backgroundColor: color }
+          })
+        : jsx(Skeleton, { className: 'size-2.5 shrink-0 rounded-full' }),
+      jsx('span', {
+        className: 'truncate text-[0.75rem] font-medium',
+        children: name
       })
     ]
   })
 }
 
+function TransitionOverlay({ active, current, neighbour, translateX, maxTravel }) {
+  if (!active) return null
+  // Rubber-band translate clamps visually to ~1 chip-width of travel so the
+  // overlay never runs away from the pointer.
+  const clamped = Math.max(-maxTravel, Math.min(maxTravel, translateX))
+  return jsx('div', {
+    className:
+      'pointer-events-none absolute inset-0 z-10 flex items-center justify-center ' +
+      'bg-(--ui-panel-background) transition-opacity duration-150',
+    style: { opacity: active ? 1 : 0 },
+    children: jsxs('div', {
+      className: 'flex items-center gap-1',
+      style: { transform: `translateX(${clamped}px)` },
+      children: [
+        current ? jsx(ProfileChip, { name: current, dimmed: false }) : null,
+        neighbour ? jsx(ProfileChip, { name: neighbour, dimmed: true }) : null
+      ]
+    })
+  })
+}
+
+/* ---------------------------------------------------------------------------
+ * Capture layer + gesture-to-lever wiring
+ * ------------------------------------------------------------------------- */
+
+const ACTIVATION_TIMEOUT_MS = 6000
+
+function GestureCapture() {
+  const containerRef = useRef(null)
+  const trackerRef = useRef(null)
+  const [gesture, setGesture] = useState({ active: false, translateX: 0, neighbour: null })
+  const activeProfile = host.state.profile.get()
+
+  useEffect(() => {
+    trackerRef.current = createWheelGestureTracker({ axis: 'x' })
+  }, [])
+
+  useEffect(() => {
+    const el = containerRef.current
+    if (!el) return undefined
+
+    let settled = true
+
+    async function computeOrder() {
+      const raw = await host.profiles.list()
+      const profiles = Array.isArray(raw) ? raw : Array.isArray(raw?.profiles) ? raw.profiles : []
+      const savedOrder = readSavedProfileOrder()
+      return orderedProfileNames(profiles, savedOrder)
+    }
+
+    async function commitSwitch(targetName) {
+      haptic?.('selection')
+      const originalProfile = host.state.profile.get()
+      let timedOut = false
+      const timeout = setTimeout(() => {
+        timedOut = true
+      }, ACTIVATION_TIMEOUT_MS)
+      try {
+        const sessions = await host.listPersistedSessions(null, { profile: targetName, limit: 1 })
+        const sessionId = sessions?.sessions?.[0]?.id ?? sessions?.[0]?.id
+        const activation = sessionId
+          ? host.openSession(sessionId, { profile: targetName, keepAllProfilesScope: false })
+          : Promise.resolve(host.newChat(targetName))
+        await Promise.race([
+          activation,
+          new Promise((_, reject) => {
+            setTimeout(() => reject(new Error(`Timed out activating ${targetName}`)), ACTIVATION_TIMEOUT_MS)
+          })
+        ])
+        clearTimeout(timeout)
+        if (timedOut) throw new Error(`Timed out activating ${targetName}`)
+      } catch (err) {
+        clearTimeout(timeout)
+        host.notifyError?.(err, `Could not switch to ${targetName}`)
+        if (host.state.profile.get() !== originalProfile) {
+          // Best-effort snap back to the original profile.
+          try {
+            const sessions = await host.listPersistedSessions(null, { profile: originalProfile, limit: 1 })
+            const sessionId = sessions?.sessions?.[0]?.id ?? sessions?.[0]?.id
+            if (sessionId) {
+              host.openSession(sessionId, { profile: originalProfile, keepAllProfilesScope: false })
+            } else {
+              host.newChat(originalProfile)
+            }
+          } catch {
+            // Nothing more we can do; the error toast already fired.
+          }
+        }
+      }
+    }
+
+    function endGesture(state) {
+      const direction = resolveDirection(state.axisMovementProjection)
+      setGesture(g => ({ ...g, active: false }))
+      if (direction === 0) return
+      computeOrder().then(order => {
+        const current = host.state.profile.get()
+        const target = neighbourProfile(order, current, direction)
+        if (target && target !== current) commitSwitch(target)
+      })
+    }
+
+    function onWheel(event) {
+      if (Math.abs(event.deltaX) <= Math.abs(event.deltaY)) return
+      event.preventDefault()
+      const tracker = trackerRef.current
+      if (!tracker) return
+      settled = false
+      const state = tracker.update(event)
+
+      if (state.isMomentumCancel) {
+        // A fresh touch landed on top of a decaying momentum tail — treat as
+        // a brand-new gesture and don't double-fire the previous one.
+        tracker.cancelEnd()
+      }
+
+      if (state.isStart) {
+        computeOrder().then(order => {
+          const current = host.state.profile.get()
+          const dir = state.deltaAccumulated < 0 ? 1 : -1
+          const neighbour = neighbourProfile(order, current, dir)
+          setGesture({ active: true, translateX: 0, neighbour })
+        })
+      }
+
+      setGesture(g => (g.active ? { ...g, translateX: -state.deltaAccumulated } : g))
+
+      tracker.scheduleEnd(state2 => {
+        settled = true
+        endGesture(state2)
+      })
+    }
+
+    el.addEventListener('wheel', onWheel, { passive: false })
+    return () => {
+      el.removeEventListener('wheel', onWheel)
+      trackerRef.current?.reset()
+    }
+  }, [])
+
+  return jsx('div', {
+    ref: containerRef,
+    className: 'pointer-events-none absolute inset-0',
+    children: jsx(TransitionOverlay, {
+      active: gesture.active,
+      current: activeProfile,
+      neighbour: gesture.neighbour,
+      translateX: gesture.translateX,
+      maxTravel: 96
+    })
+  })
+}
+
 export default {
   id: ID,
-  name: 'Profile Gestures (spike)',
+  name: 'Profile Gestures',
   register(ctx) {
     ctx.register({
-      id: 'profile-gestures-page',
-      area: ROUTES_AREA,
-      data: { path: '/profile-gestures/levers' },
-      render: () => jsx(ProfileLeverPane, {})
-    })
-    ctx.register({
-      id: 'profile-gestures-nav',
+      id: 'profile-gestures-overlay',
       area: SIDEBAR_NAV_AREA,
-      order: 90,
-      data: { codicon: 'arrow-swap', label: 'Profile Levers', path: '/profile-gestures/levers' }
+      order: 0,
+      render: () => jsx(GestureCapture, {})
     })
   }
 }

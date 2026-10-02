@@ -48,6 +48,25 @@ const ID = 'profile-gestures'
 const PROFILE_ORDER_KEY = 'hermes.desktop.profileOrder'
 
 /* ---------------------------------------------------------------------------
+ * Debug logging — `host.logs` (checked against the SDK's exports) is a READ
+ * API (`host.logs(params)` tails an app log FILE on disk; it has no write/
+ * append surface a plugin could push lines into), so there is no SDK-exposed
+ * channel to pipe runtime events into a Hermes log file. `console.log` is
+ * therefore the right surface: it lands in the renderer's devtools console,
+ * which is also where `host.logs`'s own 'desktop'/'gui' tail reads from for
+ * this process. See manual verification steps in the PR description for
+ * exactly how to open it.
+ * ------------------------------------------------------------------------- */
+const DEBUG = true
+
+function log(...args) {
+  if (!DEBUG) return
+  console.log('[profile-gestures]', ...args)
+}
+
+log('module evaluated')
+
+/* ---------------------------------------------------------------------------
  * Profile order — mirrors core's Nt()/It() in profile-D2NTN1hO.js exactly:
  *   sort non-default profiles by the saved hermes.desktop.profileOrder array
  *   (names absent from the array sort last, stable), then prepend `default`
@@ -284,19 +303,43 @@ function GestureCapture() {
   }, [])
 
   useEffect(() => {
-    const el = containerRef.current
-    if (!el) return undefined
+    log('component mounted')
+    const anchor = containerRef.current
+    if (!anchor) {
+      log('mount effect: no anchor node ref — bailing')
+      return undefined
+    }
+
+    // The anchor itself is `pointer-events-none` (it only hosts the visual
+    // overlay), so it is never a wheel hit-test target. Walk up to the real,
+    // hit-testable sidebar container and attach the listener there instead.
+    const el = anchor.closest('[data-sidebar="sidebar"]') ?? anchor.parentElement ?? anchor
+    if (el === anchor) {
+      log('WARNING: could not resolve a [data-sidebar="sidebar"] ancestor or even a parentElement; falling back to the pointer-events-none anchor itself, which will not receive wheel events')
+    } else {
+      const rect = el.getBoundingClientRect()
+      log('capture target resolved', {
+        tag: el.tagName,
+        className: el.className,
+        dataSidebar: el.getAttribute?.('data-sidebar') ?? null,
+        rect: { x: rect.x, y: rect.y, width: rect.width, height: rect.height }
+      })
+    }
 
     let settled = true
 
     async function computeOrder() {
       const raw = await host.profiles.list()
+      log('host.profiles.list() raw value', raw)
       const profiles = Array.isArray(raw) ? raw : Array.isArray(raw?.profiles) ? raw.profiles : []
       const savedOrder = readSavedProfileOrder()
-      return orderedProfileNames(profiles, savedOrder)
+      const order = orderedProfileNames(profiles, savedOrder)
+      log('computed order', order)
+      return order
     }
 
     async function commitSwitch(targetName) {
+      log('commitSwitch', { targetName })
       haptic?.('selection')
       const originalProfile = host.state.profile.get()
       let timedOut = false
@@ -317,8 +360,10 @@ function GestureCapture() {
         ])
         clearTimeout(timeout)
         if (timedOut) throw new Error(`Timed out activating ${targetName}`)
+        log('commitSwitch succeeded', { targetName })
       } catch (err) {
         clearTimeout(timeout)
+        log('commitSwitch failed', { targetName, error: String(err) })
         host.notifyError?.(err, `Could not switch to ${targetName}`)
         if (host.state.profile.get() !== originalProfile) {
           // Best-effort snap back to the original profile.
@@ -339,22 +384,37 @@ function GestureCapture() {
 
     function endGesture(state) {
       const direction = resolveDirection(state.axisMovementProjection)
+      log('gesture phase: end', { axisMovementProjection: state.axisMovementProjection, direction })
       setGesture(g => ({ ...g, active: false }))
       if (direction === 0) return
       computeOrder().then(order => {
         const current = host.state.profile.get()
         const target = neighbourProfile(order, current, direction)
+        log('resolved neighbour on end', { current, target })
         if (target && target !== current) commitSwitch(target)
       })
     }
 
     function onWheel(event) {
-      if (Math.abs(event.deltaX) <= Math.abs(event.deltaY)) return
+      const horizontal = Math.abs(event.deltaX) > Math.abs(event.deltaY)
+      if (!horizontal) {
+        log('wheel event', { deltaX: event.deltaX, deltaY: event.deltaY, horizontal: false })
+        return
+      }
       event.preventDefault()
       const tracker = trackerRef.current
       if (!tracker) return
       settled = false
       const state = tracker.update(event)
+      log('wheel event', {
+        deltaX: event.deltaX,
+        deltaY: event.deltaY,
+        horizontal: true,
+        isStart: state.isStart,
+        isMomentum: state.isMomentum,
+        isMomentumCancel: state.isMomentumCancel,
+        deltaAccumulated: state.deltaAccumulated
+      })
 
       if (state.isMomentumCancel) {
         // A fresh touch landed on top of a decaying momentum tail — treat as
@@ -363,10 +423,12 @@ function GestureCapture() {
       }
 
       if (state.isStart) {
+        log('gesture phase: start')
         computeOrder().then(order => {
           const current = host.state.profile.get()
           const dir = state.deltaAccumulated < 0 ? 1 : -1
           const neighbour = neighbourProfile(order, current, dir)
+          log('resolved neighbour on start', { current, dir, neighbour })
           setGesture({ active: true, translateX: 0, neighbour })
         })
       }
@@ -403,6 +465,7 @@ export default {
   id: ID,
   name: 'Profile Gestures',
   register(ctx) {
+    log('register() called')
     ctx.register({
       id: 'profile-gestures-overlay',
       area: SIDEBAR_NAV_AREA,
